@@ -113,6 +113,8 @@ hr { border-color:#2a2a2a !important; }
 ALLOWED_EMAILS = {
     "hussainkhansherwani09@gmail.com",
     "ghulamhussainsherwani@gmail.com",
+    "agencyleadmanager@gmail.com",
+    "tahseenimran78@gmail.com"
     # add more as needed
 }
 
