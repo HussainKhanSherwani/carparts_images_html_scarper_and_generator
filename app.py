@@ -1,0 +1,575 @@
+import streamlit as st
+import json
+import io
+import time
+import zipfile
+import pandas as pd
+import hashlib
+import os
+from datetime import datetime, timedelta
+from streamlit_cookies_manager import EncryptedCookieManager
+
+# ── Cookie manager (persistent login for 7 days) ─────────────────────────────
+cookies = EncryptedCookieManager(
+    prefix="ebay_gen_",
+    password=os.environ.get("COOKIE_SECRET", "ebay-listing-secret-key-2024"),
+)
+if not cookies.ready():
+    st.stop()
+
+st.set_page_config(
+    page_title="eBay Listing Generator",
+    page_icon="🛒",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap');
+html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
+.stApp { background: #0f0f0f; color: #e8e3d8; }
+.main .block-container { padding-top: 2rem; max-width: 1100px; }
+section[data-testid="stSidebar"] { background: #141414; border-right: 1px solid #2a2a2a; }
+
+.app-header { padding: 20px 0 28px 0; border-bottom: 1px solid #2a2a2a; margin-bottom: 28px; }
+.app-header h1 { font-weight: 800; font-size: 2rem; color: #f0c040; margin: 0; letter-spacing: -1px; }
+.app-header p  { color: #555; font-size: 0.8rem; font-family: 'DM Mono', monospace; margin: 6px 0 0 0; }
+
+.step-label {
+    font-family: 'DM Mono', monospace; font-size: 0.68rem; color: #f0c040;
+    letter-spacing: 2px; text-transform: uppercase; margin-bottom: 8px; margin-top: 4px;
+}
+
+.badge { display:inline-block; padding:3px 10px; border-radius:20px; font-size:0.7rem; font-family:'DM Mono',monospace; }
+.badge-ok    { background:#1a3a1a; color:#4caf50; border:1px solid #2d5a2d; }
+.badge-warn  { background:#3a2a00; color:#f0c040; border:1px solid #5a4400; }
+.badge-error { background:#3a1a1a; color:#f44336; border:1px solid #5a2020; }
+
+.stButton > button {
+    background:#f0c040 !important; color:#0f0f0f !important;
+    font-family:'Syne',sans-serif !important; font-weight:700 !important;
+    border:none !important; border-radius:6px !important;
+    padding:10px 28px !important; font-size:0.9rem !important; transition:all 0.2s !important;
+}
+.stButton > button:hover { background:#ffd860 !important; transform:translateY(-1px); }
+
+/* login button — blue */
+.login-btn > button { background:#4285f4 !important; color:#fff !important; }
+.login-btn > button:hover { background:#5a95f5 !important; }
+
+.stTextInput > div > div > input,
+.stTextArea  > div > div > textarea {
+    background:#1a1a1a !important; border:1px solid #2a2a2a !important;
+    color:#e8e3d8 !important; border-radius:6px !important;
+    font-family:'DM Mono',monospace !important; font-size:0.85rem !important;
+}
+.stTextInput > div > div > input:focus,
+.stTextArea  > div > div > textarea:focus {
+    border-color:#f0c040 !important; box-shadow:0 0 0 2px rgba(240,192,64,0.15) !important;
+}
+.stFileUploader > div { background:#1a1a1a !important; border:1px dashed #333 !important; border-radius:8px !important; }
+.stProgress > div > div > div > div { background:#f0c040 !important; }
+
+.log-box {
+    background:#0a0a0a; border:1px solid #2a2a2a; border-radius:6px;
+    padding:16px; font-family:'DM Mono',monospace; font-size:0.78rem;
+    color:#888; max-height:320px; overflow-y:auto; line-height:1.9;
+}
+.log-ok   { color:#4caf50; }
+.log-warn { color:#f0c040; }
+.log-err  { color:#f44336; }
+.log-info { color:#64b5f6; }
+
+.result-card {
+    background:#1a1a1a; border:1px solid #2a2a2a; border-radius:8px;
+    padding:14px 18px; margin-bottom:10px;
+}
+.result-card .item-id { font-family:'DM Mono',monospace; font-size:0.75rem; color:#f0c040; }
+
+.login-card {
+    background:#1a1a1a; border:1px solid #2a2a2a; border-radius:12px;
+    padding:40px; text-align:center; max-width:480px; margin:80px auto;
+}
+.login-card h2 { color:#f0c040; font-size:1.5rem; margin-bottom:8px; }
+.login-card p  { color:#666; font-size:0.85rem; font-family:'DM Mono',monospace; margin-bottom:28px; }
+
+.user-chip {
+    display:inline-flex; align-items:center; gap:8px;
+    background:#1a1a1a; border:1px solid #2a2a2a; border-radius:20px;
+    padding:6px 14px; font-family:'DM Mono',monospace; font-size:0.75rem; color:#aaa;
+}
+.user-chip .dot { width:8px; height:8px; border-radius:50%; background:#4caf50; display:inline-block; }
+
+hr { border-color:#2a2a2a !important; }
+#MainMenu, footer, header { visibility:hidden; }
+</style>
+""", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG — edit these for your deployment
+# ══════════════════════════════════════════════════════════════════════════════
+# Allowed emails — only these can use the app after signing in
+ALLOWED_EMAILS = {
+    "hussainkhansherwani09@gmail.com",
+    "ghulamhussainsherwani@gmail.com",
+    # add more as needed
+}
+
+# ScrapingAnt key — baked in, user never sees it
+SCRAPING_ANT_KEY = ""   # set via env var or st.secrets in production
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE
+# ══════════════════════════════════════════════════════════════════════════════
+for k, v in {
+    "user_email":   None,
+    "drive_creds":  None,
+    "logs":         [],
+    "output_zip":   None,
+    "results":      [],
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── Restore login from cookie (valid for 7 days) ──────────────────────────────
+if st.session_state.user_email is None:
+    _cookie_email   = cookies.get("user_email", "")
+    _cookie_expiry  = cookies.get("login_expiry", "")
+    if _cookie_email and _cookie_expiry:
+        try:
+            _expiry_dt = datetime.fromisoformat(_cookie_expiry)
+            if datetime.utcnow() < _expiry_dt and _cookie_email in ALLOWED_EMAILS:
+                st.session_state.user_email = _cookie_email
+        except Exception:
+            pass
+
+
+def add_log(msg: str, level: str = "info"):
+    css  = {"ok":"log-ok","warn":"log-warn","error":"log-err","info":"log-info"}.get(level,"log-info")
+    icon = {"ok":"✅","warn":"⚠️","error":"❌","info":"→"}.get(level,"→")
+    st.session_state.logs.append(f'<span class="{css}">{icon} {msg}</span>')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOAD SECRETS  (Streamlit Cloud secrets.toml or env vars)
+# ══════════════════════════════════════════════════════════════════════════════
+import os
+
+def _get_secret(key: str, fallback: str = "") -> str:
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.environ.get(key, fallback)
+
+ANT_KEY         = _get_secret("SCRAPING_ANT_KEY", SCRAPING_ANT_KEY)
+DRIVE_FOLDER_ID = _get_secret("DRIVE_FOLDER_ID", "")
+_CS_RAW         = _get_secret("CLIENT_SECRET", "")
+CLIENT_SECRET   = json.loads(_CS_RAW) if _CS_RAW else None
+
+# Push secrets into env so drive_helper.py can read them
+_SA_RAW = _get_secret("SA_CREDENTIALS", "")
+if _SA_RAW: os.environ["SA_CREDENTIALS"]  = _SA_RAW
+if DRIVE_FOLDER_ID: os.environ["DRIVE_FOLDER_ID"] = DRIVE_FOLDER_ID
+
+# ── Auto-load template.html from disk ─────────────────────────────────────────
+if "template_content" not in st.session_state:
+    for _tpath in ["template.html", os.path.join(os.getcwd(), "template.html")]:
+        if os.path.exists(_tpath):
+            with open(_tpath, "r", encoding="utf-8") as _f:
+                st.session_state["template_content"] = _f.read()
+            break
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR — dev fallbacks only
+# ══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown('<div class="step-label">⚙ Dev / Local Config</div>', unsafe_allow_html=True)
+    st.caption("Only needed if secrets.toml is not configured.")
+
+    if not CLIENT_SECRET:
+        cs_upload = st.file_uploader("client_secret.json", type=["json"])
+        if cs_upload:
+            CLIENT_SECRET = json.loads(cs_upload.read())
+            st.success("client_secret loaded")
+
+    if not ANT_KEY:
+        ANT_KEY = st.text_input("ScrapingAnt API Key", type="password")
+
+    if not DRIVE_FOLDER_ID:
+        DRIVE_FOLDER_ID = st.text_input("Drive Folder ID", placeholder="1C-pzZz...")
+
+    if st.session_state.user_email:
+        st.markdown("---")
+        st.markdown(f'<div class="user-chip"><span class="dot"></span>{st.session_state.user_email}</div>', unsafe_allow_html=True)
+        if st.button("Sign out"):
+            st.session_state.user_email  = None
+            st.session_state.drive_creds = None
+            cookies["user_email"]   = ""
+            cookies["login_expiry"] = ""
+            cookies.save()
+            st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGIN GATE
+# ══════════════════════════════════════════════════════════════════════════════
+if not st.session_state.user_email:
+    st.markdown("""
+    <div class="login-card">
+        <h2>🛒 eBay Listing Generator</h2>
+        <p>SIGN IN WITH GOOGLE TO CONTINUE</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not CLIENT_SECRET:
+        st.warning("⚠️ client_secret.json not configured. Upload it in the sidebar.")
+        st.stop()
+
+    from drive_helper import get_login_url, verify_login
+
+    # Step 1 — show sign-in button
+    if "auth_url" not in st.session_state:
+        st.session_state["auth_url"] = get_login_url(CLIENT_SECRET)
+
+    col_l, col_c, col_r = st.columns([1, 2, 1])
+    with col_c:
+        st.markdown(
+            f"""
+            <div style="text-align:center;margin-top:-60px">
+                <a href="{st.session_state['auth_url']}" target="_blank">
+                    <button style="background:#4285f4;color:#fff;border:none;padding:12px 28px;
+                    border-radius:8px;font-size:0.95rem;font-family:Syne,sans-serif;font-weight:700;
+                    cursor:pointer;letter-spacing:0.5px;width:100%;margin-bottom:16px">
+                        🔑 Sign in with Google
+                    </button>
+                </a>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Step 2 — paste code
+        st.markdown('<div class="step-label" style="text-align:center;margin-top:8px">After signing in, paste the code below</div>', unsafe_allow_html=True)
+        auth_code = st.text_input("", placeholder="4/0AX4...", label_visibility="collapsed")
+
+        if auth_code:
+            if st.button("✔ Verify & Enter"):
+                with st.spinner("Verifying..."):
+                    try:
+                        email, drive_creds = verify_login(CLIENT_SECRET, auth_code)
+                        if email in ALLOWED_EMAILS:
+                            st.session_state.user_email  = email
+                            st.session_state.drive_creds = drive_creds
+                            # Save login cookie for 7 days
+                            _expiry = (datetime.utcnow() + timedelta(days=7)).isoformat()
+                            cookies["user_email"]    = email
+                            cookies["login_expiry"]  = _expiry
+                            cookies.save()
+                            st.success(f"Welcome, {email}!")
+                            time.sleep(0.8)
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Access denied for {email}. Contact the admin to be added.")
+                    except Exception as e:
+                        st.error(f"Verification failed: {e}")
+    st.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN APP  (only reachable after successful login)
+# ══════════════════════════════════════════════════════════════════════════════
+from drive_helper import get_or_create_folder, upload_file
+from scraper      import (
+    scrape_ebay_item, merge_all_data,
+    extract_text_data, extract_item_number, parse_links,
+)
+
+# Header
+st.markdown(f"""
+<div class="app-header">
+  <h1>🛒 eBay Listing Generator</h1>
+  <p>PASTE EBAY LINKS → AUTO-SCRAPE → HTML + IMAGES + TEXT EXPORT</p>
+</div>
+<div style="display:flex;justify-content:flex-end;margin-top:-20px;margin-bottom:16px">
+  <div class="user-chip"><span class="dot"></span>{st.session_state.user_email}</div>
+</div>
+""", unsafe_allow_html=True)
+
+# Status badges
+c1, c2, c3 = st.columns(3)
+with c1:
+    ok = "template_content" in st.session_state
+    st.markdown(f'<span class="badge {"badge-ok" if ok else "badge-error"}">● Template {"Loaded" if ok else "Required — upload in sidebar"}</span>', unsafe_allow_html=True)
+with c2:
+    ok = bool(ANT_KEY)
+    st.markdown(f'<span class="badge {"badge-ok" if ok else "badge-error"}">● ScrapingAnt {"Ready" if ok else "Key Missing"}</span>', unsafe_allow_html=True)
+with c3:
+    ok = bool(DRIVE_FOLDER_ID)
+    st.markdown(f'<span class="badge {"badge-ok" if ok else "badge-warn"}">● Drive Folder {"Set" if ok else "Not Set (ZIP only)"}</span>', unsafe_allow_html=True)
+
+st.markdown("---")
+
+# ── Input tabs ────────────────────────────────────────────────────────────────
+tab_paste, tab_file = st.tabs(["📋 Paste Links", "📁 Upload CSV / Excel"])
+ebay_links = []
+
+with tab_paste:
+    st.markdown('<div class="step-label">Paste eBay links — one per line</div>', unsafe_allow_html=True)
+    raw_text = st.text_area("", placeholder="https://www.ebay.com/itm/123456789012\nhttps://www.ebay.com/itm/987654321098",
+                            height=160, label_visibility="collapsed")
+    if raw_text.strip():
+        ebay_links = parse_links(raw_text)
+        if ebay_links:
+            st.markdown(f'<span class="badge badge-ok">● {len(ebay_links)} valid link(s) detected</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="badge badge-warn">● No valid eBay links found</span>', unsafe_allow_html=True)
+
+with tab_file:
+    st.markdown('<div class="step-label">CSV or Excel — must have a column with eBay URLs</div>', unsafe_allow_html=True)
+    uploaded_file = st.file_uploader("", type=["csv","xlsx","xls"], label_visibility="collapsed")
+    if uploaded_file:
+        try:
+            df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+            st.dataframe(df.head(5), use_container_width=True)
+
+            # Auto-detect eBay URL column
+            url_col = next(
+                (c for c in df.columns if df[c].dropna().astype(str).str.contains("ebay.com/itm", na=False).any()),
+                None,
+            )
+            if url_col:
+                st.markdown(f'<span class="badge badge-ok">● Auto-detected column: {url_col}</span>', unsafe_allow_html=True)
+            else:
+                url_col = st.selectbox("Select column with eBay links", df.columns.tolist())
+
+            if url_col:
+                ebay_links = [u.strip() for u in df[url_col].dropna().astype(str).tolist() if "ebay.com" in u]
+                st.markdown(f'<span class="badge badge-ok">● {len(ebay_links)} links loaded</span>', unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"File error: {e}")
+
+st.markdown("---")
+
+# ── Output options ────────────────────────────────────────────────────────────
+st.markdown('<div class="step-label">▶ Output Options</div>', unsafe_allow_html=True)
+col_a, col_b, col_c, col_d = st.columns(4)
+with col_a: gen_html   = st.checkbox("HTML Listing",    value=True)
+with col_b: gen_images = st.checkbox("Cloudinary Images", value=True)
+with col_c: gen_text   = st.checkbox("Text Export",     value=True)
+with col_d: upload_drive = st.checkbox("Upload to Drive", value=bool(DRIVE_FOLDER_ID), disabled=not DRIVE_FOLDER_ID)
+
+# ── Run button ────────────────────────────────────────────────────────────────
+_missing = []
+if not ebay_links:                              _missing.append("eBay links")
+if not ANT_KEY:                                 _missing.append("ScrapingAnt key")
+if "template_content" not in st.session_state:  _missing.append("template.html")
+
+if _missing:
+    st.warning(f"⚠️ Still needed before generating: **{', '.join(_missing)}**")
+
+if st.button("🚀 Generate Listings", disabled=bool(_missing)):
+    template = st.session_state["template_content"]
+    st.session_state.logs       = []
+    st.session_state.results    = []
+    st.session_state.output_zip = None
+
+    total   = len(ebay_links)
+    zip_buf = io.BytesIO()
+
+    # ── Progress UI containers ────────────────────────────────────────────────
+    st.markdown("---")
+    prog_header   = st.empty()   # "Processing X / Y"
+    progress_bar  = st.progress(0)
+    stage_status  = st.empty()   # current stage pill
+    item_cols     = st.columns([2, 1, 1, 1, 1, 1])
+    results_live  = st.empty()   # live results table
+    log_container = st.empty()   # scrolling log
+
+    def update_ui(idx, item_id, stage, pct):
+        prog_header.markdown(
+            f'<div style="font-family:DM Mono,monospace;font-size:0.8rem;color:#aaa;margin-bottom:4px">' 
+            f'Item <b style="color:#f0c040">{idx+1}</b> of <b style="color:#f0c040">{total}</b>'
+            f' &nbsp;·&nbsp; <span style="color:#e8e3d8">{item_id}</span></div>',
+            unsafe_allow_html=True,
+        )
+        progress_bar.progress(pct)
+        stage_status.markdown(
+            f'<div style="margin:6px 0 10px 0">' 
+            f'<span class="badge badge-warn">⚙ {stage}</span></div>',
+            unsafe_allow_html=True,
+        )
+        log_html = "<br>".join(st.session_state.logs[-30:])
+        log_container.markdown(f'<div class="log-box">{log_html}</div>', unsafe_allow_html=True)
+
+    def done_ui():
+        prog_header.markdown(
+            f'<div style="font-family:DM Mono,monospace;font-size:0.8rem;color:#4caf50">' 
+            f'✅ All {total} item(s) processed</div>',
+            unsafe_allow_html=True,
+        )
+        progress_bar.progress(100)
+        stage_status.markdown(
+            '<div style="margin:6px 0 10px 0"><span class="badge badge-ok">✓ Done</span></div>',
+            unsafe_allow_html=True,
+        )
+        log_html = "<br>".join(st.session_state.logs[-50:])
+        log_container.markdown(f'<div class="log-box">{log_html}</div>', unsafe_allow_html=True)
+
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for idx, url in enumerate(ebay_links):
+            base_pct = int(idx / total * 100)
+
+            item_id = extract_item_number(url)
+            if not item_id:
+                add_log(f"Could not parse item ID: {url}", "error")
+                continue
+
+            add_log(f"[{idx+1}/{total}] ─── Item {item_id} ───", "info")
+
+            # ── Stage 1: Scraping ─────────────────────────────────────────
+            update_ui(idx, item_id, "Scraping eBay page...", base_pct + 2)
+            scraped = scrape_ebay_item(url, ANT_KEY)
+
+            # Log spans
+            for _s in scraped.get("span_texts", []):
+                add_log(f"Span: {_s}", "info")
+
+            if scraped["hidden_sku"]:
+                add_log(f"SKU: {scraped['hidden_sku']}", "ok")
+                add_log(f"Cloudinary images: {len(scraped['cloud_images'])}", "ok" if scraped["cloud_images"] else "warn")
+            else:
+                add_log("SKU not found — Cloudinary skipped", "warn")
+
+            gal_count = len(scraped["gallery_imgs"])
+            add_log(f"Gallery images: {gal_count}", "ok" if gal_count else "warn")
+            desc_ok = bool(scraped["desc_html"])
+            add_log("Description ✓" if desc_ok else "Description failed", "ok" if desc_ok else "error")
+            update_ui(idx, item_id, "Scraping eBay page...", base_pct + 5)
+
+            # ── Stage 2: Building HTML ────────────────────────────────────
+            html_str = text_str = None
+            sku = scraped["hidden_sku"] or "images"
+
+            if gen_html and desc_ok:
+                update_ui(idx, item_id, "Building HTML listing...", base_pct + 10)
+                try:
+                    html_str = merge_all_data(template, scraped["desc_html"], scraped["gallery_imgs"])
+                    add_log("HTML merged ✓", "ok")
+                except Exception as e:
+                    add_log(f"HTML error: {e}", "error")
+
+            # ── Stage 3: Text export ──────────────────────────────────────
+            if gen_text and desc_ok:
+                update_ui(idx, item_id, "Extracting text...", base_pct + 12)
+                try:
+                    text_str = extract_text_data(scraped["desc_html"])
+                    add_log("Text extracted ✓", "ok")
+                except Exception as e:
+                    add_log(f"Text error: {e}", "error")
+
+            # ── Stage 4: Packing ZIP ──────────────────────────────────────
+            update_ui(idx, item_id, "Packing ZIP...", base_pct + 14)
+            if html_str:
+                zf.writestr(f"{item_id}/{item_id}.html", html_str)
+            if text_str:
+                zf.writestr(f"{item_id}/{item_id}.txt", text_str)
+            if gen_images and scraped["cloud_images"]:
+                for img_no, img_bytes in scraped["cloud_images"].items():
+                    zf.writestr(f"{item_id}/{sku}/{img_no}.jpg", img_bytes)
+
+            # ── Stage 5: Drive upload ─────────────────────────────────────
+            if upload_drive and DRIVE_FOLDER_ID:
+                if not st.session_state.drive_creds:
+                    add_log("Drive skipped — sign out and back in for Drive access", "warn")
+                    upload_drive = False
+                else:
+                    update_ui(idx, item_id, "Uploading to Drive...", base_pct + 16)
+                    try:
+                        _creds = st.session_state.drive_creds
+                        item_folder = get_or_create_folder(_creds, item_id, DRIVE_FOLDER_ID)
+                        if html_str:
+                            upload_file(_creds, item_folder, f"{item_id}.html", html_str.encode("utf-8"), "text/html")
+                        if text_str:
+                            upload_file(_creds, item_folder, f"{item_id}.txt", text_str.encode("utf-8"), "text/plain")
+                        if scraped["cloud_images"]:
+                            img_folder = get_or_create_folder(_creds, sku, item_folder)
+                            for img_no, img_bytes in scraped["cloud_images"].items():
+                                upload_file(_creds, img_folder, f"{img_no}.jpg", img_bytes, "image/jpeg")
+                        add_log("Uploaded to Drive ✓", "ok")
+                    except Exception as e:
+                        if hasattr(e, "resp") and hasattr(e, "content"):
+                            status = e.resp.status
+                            try:
+                                import json as _json
+                                detail = _json.loads(e.content).get("error", {})
+                                msg = f"HTTP {status} — {detail.get('message', e.content.decode())}"
+                            except Exception:
+                                msg = f"HTTP {status} — {e.content}"
+                            add_log(f"Drive error: {msg}", "error")
+                            if status == 403:
+                                add_log("Fix: Share Drive folder with your account (Editor)", "warn")
+                            elif status == 404:
+                                add_log("Fix: Check DRIVE_FOLDER_ID in secrets.toml", "warn")
+                        else:
+                            add_log(f"Drive error: {type(e).__name__}: {e}", "error")
+
+            st.session_state.results.append({
+                "item_id": item_id, "sku": sku,
+                "html": bool(html_str), "text": bool(text_str),
+                "images": len(scraped["cloud_images"]),
+            })
+
+            # Update live results table
+            _rows = "".join(
+                f'<tr><td style="color:#f0c040;font-family:DM Mono,monospace;font-size:0.75rem">{r["item_id"]}</td>'
+                f'<td style="font-family:DM Mono,monospace;font-size:0.7rem;color:#666">{r["sku"]}</td>'
+                f'<td>{"✅" if r["html"] else "❌"}</td><td>{"✅" if r["text"] else "❌"}</td>'
+                f'<td>{"✅ " + str(r["images"]) if r["images"] else "—"}</td></tr>'
+                for r in st.session_state.results
+            )
+            results_live.markdown(
+                f'<table style="width:100%;border-collapse:collapse;font-size:0.8rem;margin-top:8px">' 
+                f'<thead><tr style="color:#555;font-family:DM Mono,monospace;font-size:0.68rem">' 
+                f'<th align="left">ITEM</th><th align="left">SKU</th>' 
+                f'<th>HTML</th><th>TXT</th><th>IMGS</th></tr></thead>' 
+                f'<tbody>{_rows}</tbody></table>',
+                unsafe_allow_html=True,
+            )
+            update_ui(idx, item_id, f"Item {idx+1} complete", int((idx + 1) / total * 95))
+
+    zip_buf.seek(0)
+    st.session_state.output_zip = zip_buf.read()
+    add_log(f"All done! {len(st.session_state.results)} item(s) processed.", "ok")
+    done_ui()
+
+# ── Results ───────────────────────────────────────────────────────────────────
+if st.session_state.results:
+    st.markdown("---")
+    st.markdown('<div class="step-label">📦 Results</div>', unsafe_allow_html=True)
+    for r in st.session_state.results:
+        h = '<span class="badge badge-ok">HTML ✓</span>'  if r["html"]   else '<span class="badge badge-error">HTML ✗</span>'
+        t = '<span class="badge badge-ok">TXT ✓</span>'   if r["text"]   else '<span class="badge badge-error">TXT ✗</span>'
+        i = f'<span class="badge badge-ok">🖼 {r["images"]}</span>' if r["images"] else '<span class="badge badge-warn">0 imgs</span>'
+        st.markdown(
+            f'<div class="result-card">'
+            f'<span class="item-id">ITEM # {r["item_id"]}</span>'
+            f'<span style="color:#555;font-family:DM Mono,monospace;font-size:0.7rem;margin-left:10px">SKU: {r["sku"]}</span>'
+            f'<div style="margin-top:8px">{h} &nbsp;{t} &nbsp;{i}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+# ── Download ZIP ──────────────────────────────────────────────────────────────
+if st.session_state.output_zip:
+    st.download_button(
+        "⬇️ Download All Results (ZIP)",
+        data=st.session_state.output_zip,
+        file_name="ebay_listings_output.zip",
+        mime="application/zip",
+    )
+
+# ── Log expander ──────────────────────────────────────────────────────────────
+if st.session_state.logs:
+    with st.expander("📜 Full Log"):
+        st.markdown(f'<div class="log-box">{"<br>".join(st.session_state.logs)}</div>', unsafe_allow_html=True)

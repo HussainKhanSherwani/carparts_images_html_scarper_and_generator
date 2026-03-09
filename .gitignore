@@ -1,0 +1,4 @@
+# Ignore Streamlit's internal files and folders
+.streamlit/
+_pycache_/
+__pycache__/    
