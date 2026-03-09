@@ -23,11 +23,18 @@ LOGIN_SCOPES = [
 
 def _redirect_uri() -> str:
     """
-    Reads APP_URL from env/secrets and builds the redirect URI.
-    Must exactly match one of the URIs registered in Google Cloud Console.
+    Streamlit is a single-page app — all redirects land on the root URL.
+    The redirect URI used to GET the code must EXACTLY match the one used to EXCHANGE it.
+    We store it in session state so both steps use the same value.
     """
+    import streamlit as st
+    # If already computed this session, reuse it
+    if "oauth_redirect_uri" in st.session_state:
+        return st.session_state["oauth_redirect_uri"]
+    # Build from APP_URL secret/env, fallback to localhost
     app_url = os.environ.get("APP_URL", "http://localhost:8501").rstrip("/")
-    return app_url   # Google redirects back to the app root with ?code=...
+    st.session_state["oauth_redirect_uri"] = app_url
+    return app_url
 
 
 # ══════════════════════════════════════════════════════════════════════════════

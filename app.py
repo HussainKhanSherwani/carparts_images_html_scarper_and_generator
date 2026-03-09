@@ -118,7 +118,6 @@ ALLOWED_EMAILS = {
     # add more as needed
 }
 
-
 # ScrapingAnt key — baked in, user never sees it
 SCRAPING_ANT_KEY = ""   # set via env var or st.secrets in production
 
@@ -172,10 +171,10 @@ CLIENT_SECRET   = json.loads(_CS_RAW) if _CS_RAW else None
 
 # Push secrets into env so drive_helper.py can read them
 _SA_RAW  = _get_secret("SA_CREDENTIALS", "")
-_APP_URL = _get_secret("APP_URL", "http://localhost:8501")
+_APP_URL = _get_secret("APP_URL", "") or "http://localhost:8501"
 if _SA_RAW:        os.environ["SA_CREDENTIALS"]  = _SA_RAW
 if DRIVE_FOLDER_ID: os.environ["DRIVE_FOLDER_ID"] = DRIVE_FOLDER_ID
-if _APP_URL:       os.environ["APP_URL"]          = _APP_URL
+if _APP_URL:       os.environ["APP_URL"]          = _APP_URL.rstrip("/")
 
 # ── Auto-load template.html from disk ─────────────────────────────────────────
 if "template_content" not in st.session_state:
