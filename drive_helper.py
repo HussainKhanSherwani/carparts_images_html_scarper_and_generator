@@ -1,7 +1,7 @@
 """
 drive_helper.py
-Uses proper OAuth redirect flow — works with Web Application client type.
-Redirect URI must match exactly what's registered in Google Cloud Console.
+OAuth redirect flow — works with Streamlit Cloud.
+The Flow object is recreated on callback using stored state.
 """
 
 import io
@@ -9,10 +9,10 @@ import os
 import json
 import requests as _requests
 
-from google.oauth2.credentials     import Credentials
-from google_auth_oauthlib.flow     import Flow
-from googleapiclient.discovery     import build
-from googleapiclient.http          import MediaIoBaseUpload
+from google.oauth2.credentials  import Credentials
+from google_auth_oauthlib.flow  import Flow
+from googleapiclient.discovery  import build
+from googleapiclient.http       import MediaIoBaseUpload
 
 LOGIN_SCOPES = [
     "openid",
@@ -21,54 +21,48 @@ LOGIN_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-def _redirect_uri() -> str:
-    """
-    Streamlit is a single-page app — all redirects land on the root URL.
-    The redirect URI used to GET the code must EXACTLY match the one used to EXCHANGE it.
-    We store it in session state so both steps use the same value.
-    """
-    import streamlit as st
-    # If already computed this session, reuse it
-    if "oauth_redirect_uri" in st.session_state:
-        return st.session_state["oauth_redirect_uri"]
-    # Build from APP_URL secret/env, fallback to localhost
-    app_url = os.environ.get("APP_URL", "http://localhost:8501").rstrip("/")
-    st.session_state["oauth_redirect_uri"] = app_url
-    return app_url
+
+def _get_redirect_uri() -> str:
+    return os.environ.get("APP_URL", "http://localhost:8501").rstrip("/")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. LOGIN — proper redirect flow
+# 1. LOGIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_login_url(client_secret_data: dict) -> tuple:
+def get_login_url(client_secret_data: dict) -> str:
     """
-    Returns (auth_url, state) — redirect user to auth_url.
-    State is saved in session to verify on callback.
+    Builds OAuth URL. Uses no PKCE / code_challenge so the flow can be
+    reconstructed from scratch on the callback — no session state needed.
     """
     flow = Flow.from_client_config(
         client_secret_data,
         scopes=LOGIN_SCOPES,
-        redirect_uri=_redirect_uri(),
+        redirect_uri=_get_redirect_uri(),
     )
-    auth_url, state = flow.authorization_url(
+    auth_url, _ = flow.authorization_url(
         access_type="offline",
         prompt="consent",
         include_granted_scopes="true",
     )
-    return auth_url, state
+    return auth_url
 
 
 def verify_login(client_secret_data: dict, auth_code: str) -> tuple:
     """
-    Exchanges the auth code for credentials.
+    Exchanges auth code for credentials.
+    Rebuilds Flow from scratch — does NOT need the original flow object.
     Returns (email, credentials).
     """
     flow = Flow.from_client_config(
         client_secret_data,
         scopes=LOGIN_SCOPES,
-        redirect_uri=_redirect_uri(),
+        redirect_uri=_get_redirect_uri(),
     )
+    # Disable HTTPS check for localhost dev
+    import os as _os
+    _os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+
     flow.fetch_token(code=auth_code.strip())
     creds = flow.credentials
 
@@ -105,7 +99,6 @@ def get_or_create_folder(creds: Credentials, name: str, parent_id: str) -> str:
     ).execute().get("files", [])
     if hits:
         return hits[0]["id"]
-
     meta   = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
     folder = svc.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
     return folder["id"]

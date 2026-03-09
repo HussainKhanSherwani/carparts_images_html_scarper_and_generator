@@ -259,7 +259,7 @@ if not st.session_state.user_email:
                 st.stop()
     else:
         # Show sign-in button — redirect to Google
-        auth_url, _state = get_login_url(CLIENT_SECRET)
+        auth_url = get_login_url(CLIENT_SECRET)
         col_l, col_c, col_r = st.columns([1, 2, 1])
         with col_c:
             st.markdown(
