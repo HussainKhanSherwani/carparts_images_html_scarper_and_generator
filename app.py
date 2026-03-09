@@ -118,6 +118,7 @@ ALLOWED_EMAILS = {
     # add more as needed
 }
 
+
 # ScrapingAnt key — baked in, user never sees it
 SCRAPING_ANT_KEY = ""   # set via env var or st.secrets in production
 
@@ -170,9 +171,11 @@ _CS_RAW         = _get_secret("CLIENT_SECRET", "")
 CLIENT_SECRET   = json.loads(_CS_RAW) if _CS_RAW else None
 
 # Push secrets into env so drive_helper.py can read them
-_SA_RAW = _get_secret("SA_CREDENTIALS", "")
-if _SA_RAW: os.environ["SA_CREDENTIALS"]  = _SA_RAW
+_SA_RAW  = _get_secret("SA_CREDENTIALS", "")
+_APP_URL = _get_secret("APP_URL", "http://localhost:8501")
+if _SA_RAW:        os.environ["SA_CREDENTIALS"]  = _SA_RAW
 if DRIVE_FOLDER_ID: os.environ["DRIVE_FOLDER_ID"] = DRIVE_FOLDER_ID
+if _APP_URL:       os.environ["APP_URL"]          = _APP_URL
 
 # ── Auto-load template.html from disk ─────────────────────────────────────────
 if "template_content" not in st.session_state:
@@ -230,52 +233,49 @@ if not st.session_state.user_email:
 
     from drive_helper import get_login_url, verify_login
 
-    # Step 1 — show sign-in button
-    if "auth_url" not in st.session_state:
-        st.session_state["auth_url"] = get_login_url(CLIENT_SECRET)
+    # Check if Google redirected back with ?code= in URL
+    _params     = st.query_params
+    _auth_code  = _params.get("code", "")
+    _auth_state = _params.get("state", "")
 
-    col_l, col_c, col_r = st.columns([1, 2, 1])
-    with col_c:
-        st.markdown(
-            f"""
-            <div style="text-align:center;margin-top:-60px">
-                <a href="{st.session_state['auth_url']}" target="_blank">
-                    <button style="background:#4285f4;color:#fff;border:none;padding:12px 28px;
-                    border-radius:8px;font-size:0.95rem;font-family:Syne,sans-serif;font-weight:700;
-                    cursor:pointer;letter-spacing:0.5px;width:100%;margin-bottom:16px">
-                        🔑 Sign in with Google
-                    </button>
-                </a>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        # Step 2 — paste code
-        st.markdown('<div class="step-label" style="text-align:center;margin-top:8px">After signing in, paste the code below</div>', unsafe_allow_html=True)
-        auth_code = st.text_input("", placeholder="4/0AX4...", label_visibility="collapsed")
-
-        if auth_code:
-            if st.button("✔ Verify & Enter"):
-                with st.spinner("Verifying..."):
-                    try:
-                        email, drive_creds = verify_login(CLIENT_SECRET, auth_code)
-                        if email in ALLOWED_EMAILS:
-                            st.session_state.user_email  = email
-                            st.session_state.drive_creds = drive_creds
-                            # Save login cookie for 7 days
-                            _expiry = (datetime.utcnow() + timedelta(days=7)).isoformat()
-                            cookies["user_email"]    = email
-                            cookies["login_expiry"]  = _expiry
-                            cookies.save()
-                            st.success(f"Welcome, {email}!")
-                            time.sleep(0.8)
-                            st.rerun()
-                        else:
-                            st.error(f"❌ Access denied for {email}. Contact the admin to be added.")
-                    except Exception as e:
-                        st.error(f"Verification failed: {e}")
-    st.stop()
+    if _auth_code:
+        # Google redirected back — exchange code for credentials
+        with st.spinner("Signing you in..."):
+            try:
+                email, drive_creds = verify_login(CLIENT_SECRET, _auth_code)
+                st.query_params.clear()   # remove ?code= from URL
+                if email in ALLOWED_EMAILS:
+                    st.session_state.user_email  = email
+                    st.session_state.drive_creds = drive_creds
+                    _expiry = (datetime.utcnow() + timedelta(days=7)).isoformat()
+                    cookies["user_email"]   = email
+                    cookies["login_expiry"] = _expiry
+                    cookies.save()
+                    st.rerun()
+                else:
+                    st.error(f"❌ Access denied for {email}. Contact the admin to be added.")
+                    st.stop()
+            except Exception as e:
+                st.error(f"Sign-in failed: {e}")
+                st.stop()
+    else:
+        # Show sign-in button — redirect to Google
+        auth_url, _state = get_login_url(CLIENT_SECRET)
+        col_l, col_c, col_r = st.columns([1, 2, 1])
+        with col_c:
+            st.markdown(
+                f'''<div style="text-align:center;margin-top:-60px">
+                    <a href="{auth_url}">
+                        <button style="background:#4285f4;color:#fff;border:none;padding:14px 32px;
+                        border-radius:8px;font-size:1rem;font-family:Syne,sans-serif;font-weight:700;
+                        cursor:pointer;letter-spacing:0.5px;width:100%">
+                            🔑 Sign in with Google
+                        </button>
+                    </a>
+                </div>''',
+                unsafe_allow_html=True,
+            )
+        st.stop()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

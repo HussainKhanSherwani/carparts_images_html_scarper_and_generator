@@ -1,15 +1,11 @@
 """
 drive_helper.py
-─────────────────────────────────────────────────────────────────────────────
-Architecture:
-  • User logs in with Google OAuth — identity + Drive scope.
-  • ALL Drive operations use the logged-in USER's credentials.
-  • Files go to DRIVE_FOLDER_ID which must be shared with the user (Editor).
-  • No service account involved in uploads at all.
-─────────────────────────────────────────────────────────────────────────────
+Uses proper OAuth redirect flow — works with Web Application client type.
+Redirect URI must match exactly what's registered in Google Cloud Console.
 """
 
 import io
+import os
 import json
 import requests as _requests
 
@@ -18,7 +14,6 @@ from google_auth_oauthlib.flow     import Flow
 from googleapiclient.discovery     import build
 from googleapiclient.http          import MediaIoBaseUpload
 
-# Login scope includes Drive so the user's token can upload
 LOGIN_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -26,25 +21,46 @@ LOGIN_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
+def _redirect_uri() -> str:
+    """
+    Reads APP_URL from env/secrets and builds the redirect URI.
+    Must exactly match one of the URIs registered in Google Cloud Console.
+    """
+    app_url = os.environ.get("APP_URL", "http://localhost:8501").rstrip("/")
+    return app_url   # Google redirects back to the app root with ?code=...
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. LOGIN
+# 1. LOGIN — proper redirect flow
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_login_url(client_secret_data: dict) -> str:
+def get_login_url(client_secret_data: dict) -> tuple:
+    """
+    Returns (auth_url, state) — redirect user to auth_url.
+    State is saved in session to verify on callback.
+    """
     flow = Flow.from_client_config(
-        client_secret_data, scopes=LOGIN_SCOPES, redirect_uri=REDIRECT_URI,
+        client_secret_data,
+        scopes=LOGIN_SCOPES,
+        redirect_uri=_redirect_uri(),
     )
-    url, _ = flow.authorization_url(access_type="offline", prompt="consent")
-    return url
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="true",
+    )
+    return auth_url, state
 
 
 def verify_login(client_secret_data: dict, auth_code: str) -> tuple:
-    """Returns (email, credentials)."""
+    """
+    Exchanges the auth code for credentials.
+    Returns (email, credentials).
+    """
     flow = Flow.from_client_config(
-        client_secret_data, scopes=LOGIN_SCOPES, redirect_uri=REDIRECT_URI,
+        client_secret_data,
+        scopes=LOGIN_SCOPES,
+        redirect_uri=_redirect_uri(),
     )
     flow.fetch_token(code=auth_code.strip())
     creds = flow.credentials
@@ -62,7 +78,7 @@ def verify_login(client_secret_data: dict, auth_code: str) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. DRIVE OPERATIONS — all use the logged-in user's credentials
+# 2. DRIVE OPERATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _svc(creds: Credentials):
@@ -70,30 +86,25 @@ def _svc(creds: Credentials):
 
 
 def get_or_create_folder(creds: Credentials, name: str, parent_id: str) -> str:
-    """Finds or creates a subfolder inside parent_id. Returns folder ID."""
     svc   = _svc(creds)
     query = (
         f"mimeType='application/vnd.google-apps.folder'"
         f" and name='{name}' and '{parent_id}' in parents and trashed=false"
     )
     hits = svc.files().list(
-        q=query, fields="files(id)", 
+        q=query, fields="files(id)",
         includeItemsFromAllDrives=True,
         supportsAllDrives=True,
     ).execute().get("files", [])
-
     if hits:
         return hits[0]["id"]
 
     meta   = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-    folder = svc.files().create(
-        body=meta, fields="id", supportsAllDrives=True,
-    ).execute()
+    folder = svc.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
     return folder["id"]
 
 
 def upload_file(creds: Credentials, folder_id: str, filename: str, content: bytes, mimetype: str) -> str:
-    """Uploads bytes into folder_id using user credentials. Returns file ID."""
     svc   = _svc(creds)
     fh    = io.BytesIO(content)
     media = MediaIoBaseUpload(fh, mimetype=mimetype, resumable=True)
