@@ -1,18 +1,15 @@
 """
 drive_helper.py
-OAuth redirect flow — works with Streamlit Cloud.
-The Flow object is recreated on callback using stored state.
+Manual OAuth token exchange — bypasses google_auth_oauthlib's PKCE entirely.
 """
 
 import io
 import os
 import json
 import requests as _requests
-
-from google.oauth2.credentials  import Credentials
-from google_auth_oauthlib.flow  import Flow
-from googleapiclient.discovery  import build
-from googleapiclient.http       import MediaIoBaseUpload
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http      import MediaIoBaseUpload
 
 LOGIN_SCOPES = [
     "openid",
@@ -20,61 +17,78 @@ LOGIN_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/drive",
 ]
+SCOPE_STR = " ".join(LOGIN_SCOPES)
 
 
-def _get_redirect_uri() -> str:
+def _redirect_uri() -> str:
     return os.environ.get("APP_URL", "http://localhost:8501").rstrip("/")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. LOGIN
+# 1. LOGIN — build URL manually, no Flow object, no PKCE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_login_url(client_secret_data: dict) -> str:
-    """
-    Builds OAuth URL. Uses no PKCE / code_challenge so the flow can be
-    reconstructed from scratch on the callback — no session state needed.
-    """
-    flow = Flow.from_client_config(
-        client_secret_data,
-        scopes=LOGIN_SCOPES,
-        redirect_uri=_get_redirect_uri(),
-    )
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        include_granted_scopes="true",
-    )
-    return auth_url
+    """Builds Google OAuth URL manually — zero PKCE, no Flow state needed."""
+    import urllib.parse
+    cfg       = client_secret_data.get("web", client_secret_data)
+    client_id = cfg["client_id"]
+    auth_uri  = cfg.get("auth_uri", "https://accounts.google.com/o/oauth2/auth")
+
+    params = {
+        "client_id":     client_id,
+        "redirect_uri":  _redirect_uri(),
+        "response_type": "code",
+        "scope":         SCOPE_STR,
+        "access_type":   "offline",
+        "prompt":        "consent",
+    }
+    return f"{auth_uri}?{urllib.parse.urlencode(params)}"
 
 
 def verify_login(client_secret_data: dict, auth_code: str) -> tuple:
     """
-    Exchanges auth code for credentials.
-    Rebuilds Flow from scratch — does NOT need the original flow object.
-    Returns (email, credentials).
+    Exchanges auth code for tokens via direct HTTP POST — no Flow, no PKCE.
+    Returns (email, google.oauth2.credentials.Credentials).
     """
-    flow = Flow.from_client_config(
-        client_secret_data,
-        scopes=LOGIN_SCOPES,
-        redirect_uri=_get_redirect_uri(),
-    )
-    # Disable HTTPS check for localhost dev
-    import os as _os
-    _os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    cfg           = client_secret_data.get("web", client_secret_data)
+    client_id     = cfg["client_id"]
+    client_secret = cfg["client_secret"]
+    token_uri     = cfg.get("token_uri", "https://oauth2.googleapis.com/token")
 
-    flow.fetch_token(code=auth_code.strip())
-    creds = flow.credentials
+    # Manual token exchange
+    resp = _requests.post(token_uri, data={
+        "code":          auth_code.strip(),
+        "client_id":     client_id,
+        "client_secret": client_secret,
+        "redirect_uri":  _redirect_uri(),
+        "grant_type":    "authorization_code",
+    }, timeout=15)
 
-    resp = _requests.get(
+    if resp.status_code != 200:
+        raise ValueError(f"Token exchange failed: {resp.text}")
+
+    tokens = resp.json()
+
+    # Fetch user email
+    user_resp = _requests.get(
         "https://www.googleapis.com/oauth2/v3/userinfo",
-        headers={"Authorization": f"Bearer {creds.token}"},
+        headers={"Authorization": f"Bearer {tokens['access_token']}"},
         timeout=10,
     )
-    if resp.status_code != 200:
-        raise ValueError(f"Could not fetch user info: {resp.text}")
+    if user_resp.status_code != 200:
+        raise ValueError(f"Could not fetch user info: {user_resp.text}")
+    email = user_resp.json().get("email", "").lower()
 
-    email = resp.json().get("email", "").lower()
+    # Build Credentials object for Drive API
+    creds = Credentials(
+        token         = tokens["access_token"],
+        refresh_token = tokens.get("refresh_token"),
+        token_uri     = token_uri,
+        client_id     = client_id,
+        client_secret = client_secret,
+        scopes        = LOGIN_SCOPES,
+    )
     return email, creds
 
 
