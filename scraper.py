@@ -220,18 +220,251 @@ def fetch_description_html(product_url: str, api_key: str):
     return iframe_content
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6b. EBAY MOTORS COMPATIBILITY TABLE (main page + pagination)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_compat_table_page(html_str: str) -> list:
+    """
+    Parses one page of the motors compatibility table.
+    Returns list of dicts: {year, make, model, trim, engine, notes}
+    """
+    if not html_str:
+        return []
+    soup = BeautifulSoup(html_str, "html.parser")
+    rows = []
+    table = soup.find("table", {"class": lambda c: c and "ux-table-section" in c})
+    if not table:
+        return []
+    for tr in table.find("tbody").find_all("tr"):
+        cells = tr.find_all("td")
+        if len(cells) < 5:
+            continue
+        def _cell(i):
+            # Get only the first ux-textspans inside the cell (ignore Read more/less buttons)
+            spans = cells[i].find_all("span", {"class": "ux-textspans"})
+            # First span is the real text, rest are button labels
+            return spans[0].get_text(strip=True) if spans else ""
+        rows.append({
+            "year":   _cell(0),
+            "make":   _cell(1),
+            "model":  _cell(2),
+            "trim":   _cell(3),
+            "engine": _cell(4),
+            "notes":  _cell(5) if len(cells) > 5 else "",
+        })
+    return rows
+
+
+def _get_compat_page_count(html_str: str) -> int:
+    """Returns total number of pagination pages from the compat table."""
+    if not html_str:
+        return 1
+    soup  = BeautifulSoup(html_str, "html.parser")
+    items = soup.select(".motors-pagination .pagination__items .pagination__item")
+    nums  = []
+    for item in items:
+        try:
+            nums.append(int(item.get_text(strip=True)))
+        except ValueError:
+            pass
+    return max(nums) if nums else 1
+
+
+def _fetch_compat_json(item_id: str, offset: int, session_cookies: dict,
+                        seller_name: str = "", category_id: str = "") -> list:
+    """
+    Fetches compatibility rows via eBay /g/api/finders POST with session cookies.
+    Returns list of row dicts.
+    """
+    import json as _json
+    url = (
+        "https://www.ebay.com/g/api/finders"
+        f"?module_groups=PART_FINDER&referrer=VIEWITEM"
+        f"&offset={offset}&module=COMPATIBILITY_TABLE"
+    )
+    headers = {
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+        "Origin":        "https://www.ebay.com",
+        "Referer":       f"https://www.ebay.com/itm/{item_id}",
+        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "x-ebay-c-marketplace-id":  "EBAY-US",
+        "x-ebay-c-tracking-config": "viewTrackingEnabled=true,perfTrackingEnabled=true",
+    }
+    payload = {
+        "scopedContext": {
+            "catalogDetails": {
+                "itemId":        item_id,
+                "sellerName":    seller_name,
+                "categoryId":    category_id or "262146",
+                "marketplaceId": "EBAY-US",
+            }
+        }
+    }
+    try:
+        resp = _requests.post(
+            url, json=payload, headers=headers,
+            cookies=session_cookies, timeout=15
+        )
+        if resp.status_code != 200:
+            return []
+        data     = resp.json()
+        rows_raw = (
+            data.get("modules", {})
+                .get("COMPATIBILITY_TABLE", {})
+                .get("paginatedTable", {})
+                .get("rows", [])
+        )
+        rows = []
+        for row in rows_raw:
+            cells = row.get("cells", [])
+            def _cell_text(c):
+                spans = (
+                    c.get("textSpans") or
+                    (c.get("textualDisplays") or [{}])[0].get("textSpans", [])
+                )
+                return spans[0].get("text", "") if spans else ""
+            if len(cells) >= 5:
+                rows.append({
+                    "year":   _cell_text(cells[0]),
+                    "make":   _cell_text(cells[1]),
+                    "model":  _cell_text(cells[2]),
+                    "trim":   _cell_text(cells[3]),
+                    "engine": _cell_text(cells[4]),
+                    "notes":  _cell_text(cells[5]) if len(cells) > 5 else "",
+                })
+        return rows
+    except Exception:
+        return []
+
+
+def scrape_compatibility_table(item_id: str, main_html: str, api_key: str,
+                               session_cookies: dict = None) -> list:
+    """
+    Scrapes ALL pages of the eBay motors compatibility table.
+    Page 1: parsed from main_html (reliable).
+    Page 2+: POST to /g/api/finders with session cookies obtained from a fresh GET.
+    """
+    import re as _re
+
+    # Page 1 from main HTML
+    all_rows    = _parse_compat_table_page(main_html)
+    total_pages = _get_compat_page_count(main_html)
+
+    if total_pages <= 1:
+        return all_rows
+
+    # Extract meta from main page
+    seller_name = ""
+    category_id = ""
+    try:
+        m = _re.search(r'"sellerName"\s*:\s*"([^"]+)"', main_html)
+        if m:
+            seller_name = m.group(1)
+        m2 = _re.search(r'"categoryId"\s*:\s*"([^"]+)"', main_html)
+        if m2:
+            category_id = m2.group(1)
+    except Exception:
+        pass
+
+    # Get fresh session cookies by doing a real GET on the item page
+    cookies = {}
+    try:
+        r = _requests.get(
+            f"https://www.ebay.com/itm/{item_id}",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            timeout=15,
+            allow_redirects=True,
+        )
+        cookies = dict(r.cookies)
+    except Exception:
+        pass
+
+    PAGE_SIZE = 20
+    for page in range(2, total_pages + 1):
+        offset = (page - 1) * PAGE_SIZE
+        rows   = _fetch_compat_json(item_id, offset, cookies, seller_name, category_id)
+        if rows:
+            all_rows.extend(rows)
+        time.sleep(0.5)
+
+    return all_rows
+
+
+
+
+def extract_item_specs(html_str: str) -> dict:
+    """
+    Extracts the full item specs table from eBay listing using text-search approach.
+    Returns dict of all label->value pairs found, plus a 'part_link_number' key
+    that tries multiple known field name variants.
+    """
+    if not html_str:
+        return {}
+    import re as _re
+    soup = BeautifulSoup(html_str, "html.parser")
+
+    specs = {}
+
+    # Generic: find all dl.ux-labels-values and extract label->value pairs
+    for dl in soup.find_all("dl", {"data-testid": "ux-labels-values"}):
+        dt = dl.find("dt")
+        dd = dl.find("dd")
+        if dt and dd:
+            label = dt.get_text(strip=True)
+            # For dd, get first ux-textspans (skip Read more/less button text)
+            spans = dd.find_all("span", {"class": "ux-textspans"})
+            value = spans[0].get_text(strip=True) if spans else dd.get_text(strip=True)
+            if label and value:
+                specs[label] = value
+
+    # Resolve Part Link Number from known variants (most specific first)
+    part_link_variants = [
+        "Part Link Number", "Parts Link Number",
+        "Partslink Number", "Replaces Partslink Number",
+    ]
+    part_link_number = None
+    for variant in part_link_variants:
+        # Try exact key first
+        if variant in specs:
+            part_link_number = specs[variant]
+            break
+        # Try case-insensitive text search as fallback
+        tag = soup.find(string=_re.compile(rf"^{re.escape(variant)}$", _re.I))
+        if tag:
+            nxt = tag.find_next("span", {"class": "ux-textspans"})
+            if nxt:
+                part_link_number = nxt.get_text(strip=True)
+                break
+
+    specs["_part_link_number"] = part_link_number
+    return specs
+
+
+def extract_part_link_number(html_str: str) -> str | None:
+    """Convenience wrapper — returns just the part link number."""
+    return extract_item_specs(html_str).get("_part_link_number")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 7. MASTER SCRAPE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def scrape_ebay_item(ebay_url: str, api_key: str) -> dict:
     result = {
-        "item_id":      None,
-        "hidden_sku":   None,
-        "gallery_imgs": [],
-        "cloud_images": {},
-        "desc_html":    None,
-        "span_texts":   [],
+        "item_id":          None,
+        "hidden_sku":       None,
+        "part_link_number": None,
+        "item_specs":       {},
+        "seller_name":      None,
+        "gallery_imgs":     [],
+        "cloud_images":     {},
+        "desc_html":        None,
+        "span_texts":       [],
+        "compat_rows":      [],
     }
 
     item_id = extract_item_number(ebay_url)
@@ -239,11 +472,29 @@ def scrape_ebay_item(ebay_url: str, api_key: str) -> dict:
         return result
     result["item_id"] = item_id
 
-    # Fetch main page once — reuse for SKU + gallery
-    main_html = (
-        fetch_url_standard(f"https://www.ebay.com/itm/{item_id}") or
-        fetch_html_scrapingant(f"https://www.ebay.com/itm/{item_id}", api_key)
-    )
+    # Fetch main page once via standard requests
+    item_url  = f"https://www.ebay.com/itm/{item_id}"
+    main_html = fetch_url_standard(item_url)
+
+    # If standard fetch didn't get specs (JS-rendered), use ScrapingAnt ONCE
+    # and reuse that html for everything (gallery, specs, compat)
+    specs = extract_item_specs(main_html) if main_html else {}
+    if not specs.get("_part_link_number"):
+        main_html = fetch_html_scrapingant(item_url, api_key) or main_html
+
+    # Seller name (from main HTML JSON-LD)
+    import re as _re2
+    m = _re2.search(r'"sellerName"\s*:\s*"([^"]+)"', main_html or "")
+    if m:
+        result["seller_name"] = m.group(1)
+
+    # Extract specs from whichever main_html we ended up with
+    specs = extract_item_specs(main_html)
+    result["part_link_number"] = specs.get("_part_link_number")
+    result["item_specs"]       = {k: v for k, v in specs.items() if not k.startswith("_")}
+
+    # Motors compatibility table (all pages)
+    result["compat_rows"] = scrape_compatibility_table(item_id, main_html, api_key)
 
     # eBay gallery images
     result["gallery_imgs"] = parse_images_from_html(main_html)
@@ -624,7 +875,7 @@ def merge_all_data(template_str: str, source_data_html: str, image_urls: list) -
 # 12. TEXT EXPORT  (new — not in original)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_text_data(source_data_html: str) -> str:
+def extract_text_data(source_data_html: str, compat_rows: list = None) -> str:
     """Exports all listing sections to a clean plain-text file."""
     soup  = BeautifulSoup(source_data_html, "html.parser")
     lines = []
@@ -686,8 +937,8 @@ def extract_text_data(source_data_html: str) -> str:
         lines.append("(not found)")
     lines.append("")
 
-    # Compatibility
-    lines += [sep, "COMPATIBILITY", sep]
+    # Compatibility — iframe-based (carparts format)
+    lines += [sep, "COMPATIBILITY (Description)", sep]
     container = soup.find("div", class_="item__list")
     if container:
         for block in container.find_all("div", class_="items__list--content"):
@@ -697,6 +948,27 @@ def extract_text_data(source_data_html: str) -> str:
                 elif child.name == "ul":
                     for li in child.find_all("li"):
                         lines.append(f"  - {li.get_text(' ', strip=True)}")
+    else:
+        lines.append("(not found)")
+    lines.append("")
+
+    # eBay Motors Compatibility Table (all pages from main listing)
+    lines += [sep, "FITMENT TABLE", sep]
+    if compat_rows:
+        # Header
+        lines.append(f"{'Year':<6} {'Make':<16} {'Model':<10} {'Trim':<30} {'Engine':<45} Notes")
+        lines.append("-" * 120)
+        for r in compat_rows:
+            line = (
+                f"{r.get('year',''):<6} "
+                f"{r.get('make',''):<16} "
+                f"{r.get('model',''):<10} "
+                f"{r.get('trim',''):<30} "
+                f"{r.get('engine',''):<45} "
+                f"{r.get('notes','')}"
+            )
+            lines.append(line)
+        lines.append(f"\nTotal: {len(compat_rows)} vehicle(s)")
     else:
         lines.append("(not found)")
     lines.append("")

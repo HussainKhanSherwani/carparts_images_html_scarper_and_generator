@@ -113,8 +113,6 @@ hr { border-color:#2a2a2a !important; }
 ALLOWED_EMAILS = {
     "hussainkhansherwani09@gmail.com",
     "ghulamhussainsherwani@gmail.com",
-    "agencyleadmanager@gmail.com",
-    "tahseenimran78@gmail.com"
     # add more as needed
 }
 
@@ -292,10 +290,20 @@ st.markdown(f"""
   <h1>🛒 eBay Listing Generator</h1>
   <p>PASTE EBAY LINKS → AUTO-SCRAPE → HTML + IMAGES + TEXT EXPORT</p>
 </div>
-<div style="display:flex;justify-content:flex-end;margin-top:-20px;margin-bottom:16px">
+<div style="display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:-20px;margin-bottom:16px">
   <div class="user-chip"><span class="dot"></span>{st.session_state.user_email}</div>
 </div>
 """, unsafe_allow_html=True)
+
+_signout_col = st.columns([6, 1])[1]
+with _signout_col:
+    if st.button("Sign out", key="main_signout", use_container_width=True):
+        st.session_state.user_email  = None
+        st.session_state.drive_creds = None
+        cookies["user_email"]   = ""
+        cookies["login_expiry"] = ""
+        cookies.save()
+        st.rerun()
 
 # Status badges
 c1, c2, c3 = st.columns(3)
@@ -394,7 +402,7 @@ if st.button("🚀 Generate Listings", disabled=bool(_missing)):
             f' &nbsp;·&nbsp; <span style="color:#e8e3d8">{item_id}</span></div>',
             unsafe_allow_html=True,
         )
-        progress_bar.progress(pct)
+        progress_bar.progress(min(100, max(0, int(pct))))
         stage_status.markdown(
             f'<div style="margin:6px 0 10px 0">' 
             f'<span class="badge badge-warn">⚙ {stage}</span></div>',
@@ -409,7 +417,7 @@ if st.button("🚀 Generate Listings", disabled=bool(_missing)):
             f'✅ All {total} item(s) processed</div>',
             unsafe_allow_html=True,
         )
-        progress_bar.progress(100)
+        progress_bar.progress(min(100, max(0, int(100))))
         stage_status.markdown(
             '<div style="margin:6px 0 10px 0"><span class="badge badge-ok">✓ Done</span></div>',
             unsafe_allow_html=True,
@@ -442,6 +450,22 @@ if st.button("🚀 Generate Listings", disabled=bool(_missing)):
             else:
                 add_log("SKU not found — Cloudinary skipped", "warn")
 
+            _pln_log = scraped.get("part_link_number")
+            if _pln_log:
+                add_log(f"Part Link Number: {_pln_log}", "ok")
+            else:
+                add_log("Part Link Number not found — folder name will use SKU/seller only", "warn")
+
+            _seller_log = scraped.get("seller_name")
+            if _seller_log:
+                add_log(f"Seller: {_seller_log}", "info")
+
+            # Log the final folder name that will be used
+            _pln_f  = scraped.get("part_link_number") or ""
+            _sku_lf = scraped.get("hidden_sku") or ""
+            _folder_preview = " ".join(p for p in [_pln_f, _sku_lf, item_id] if p)
+            add_log(f"Drive folder name: {_folder_preview}", "info")
+
             gal_count = len(scraped["gallery_imgs"])
             add_log(f"Gallery images: {gal_count}", "ok" if gal_count else "warn")
             desc_ok = bool(scraped["desc_html"])
@@ -464,20 +488,24 @@ if st.button("🚀 Generate Listings", disabled=bool(_missing)):
             if gen_text and desc_ok:
                 update_ui(idx, item_id, "Extracting text...", base_pct + 12)
                 try:
-                    text_str = extract_text_data(scraped["desc_html"])
+                    text_str = extract_text_data(scraped["desc_html"], scraped.get("compat_rows", []))
                     add_log("Text extracted ✓", "ok")
                 except Exception as e:
                     add_log(f"Text error: {e}", "error")
 
             # ── Stage 4: Packing ZIP ──────────────────────────────────────
             update_ui(idx, item_id, "Packing ZIP...", base_pct + 14)
+            # Use same naming convention as Drive: PartLinkNumber HiddenSKU ItemID
+            _pln_z  = scraped.get("part_link_number") or ""
+            _sku_z  = scraped.get("hidden_sku") or ""
+            _zip_folder = " ".join(p for p in [_pln_z, _sku_z, item_id] if p)
             if html_str:
-                zf.writestr(f"{item_id}/{item_id}.html", html_str)
+                zf.writestr(f"{_zip_folder}/{item_id}.html", html_str)
             if text_str:
-                zf.writestr(f"{item_id}/{item_id}.txt", text_str)
+                zf.writestr(f"{_zip_folder}/{item_id}.txt", text_str)
             if gen_images and scraped["cloud_images"]:
                 for img_no, img_bytes in scraped["cloud_images"].items():
-                    zf.writestr(f"{item_id}/{sku}/{img_no}.jpg", img_bytes)
+                    zf.writestr(f"{_zip_folder}/{sku}/{img_no}.jpg", img_bytes)
 
             # ── Stage 5: Drive upload ─────────────────────────────────────
             if upload_drive and DRIVE_FOLDER_ID:
@@ -488,7 +516,12 @@ if st.button("🚀 Generate Listings", disabled=bool(_missing)):
                     update_ui(idx, item_id, "Uploading to Drive...", base_pct + 16)
                     try:
                         _creds = st.session_state.drive_creds
-                        item_folder = get_or_create_folder(_creds, item_id, DRIVE_FOLDER_ID)
+                        # Folder name: PartLinkNumber + HiddenSKU + SourceItemNumber(item_id)
+                        _pln   = scraped.get("part_link_number") or ""
+                        _sku_f = scraped.get("hidden_sku") or ""
+                        _parts = [p for p in [_pln, _sku_f, item_id] if p]
+                        folder_display_name = " ".join(_parts)
+                        item_folder = get_or_create_folder(_creds, folder_display_name, DRIVE_FOLDER_ID)
                         if html_str:
                             upload_file(_creds, item_folder, f"{item_id}.html", html_str.encode("utf-8"), "text/html")
                         if text_str:
