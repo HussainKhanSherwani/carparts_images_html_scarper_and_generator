@@ -1,15 +1,17 @@
 """
 drive_helper.py
-Manual OAuth token exchange — bypasses google_auth_oauthlib's PKCE entirely.
+Manual OAuth token exchange — no PKCE.
+Also supports Service Account for user Drive uploads.
 """
 
 import io
 import os
 import json
 import requests as _requests
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http      import MediaIoBaseUpload
+from google.oauth2.credentials        import Credentials
+from google.oauth2                    import service_account
+from googleapiclient.discovery        import build
+from googleapiclient.http             import MediaIoBaseUpload
 
 LOGIN_SCOPES = [
     "openid",
@@ -17,6 +19,7 @@ LOGIN_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/drive",
 ]
+SA_SCOPES = ["https://www.googleapis.com/auth/drive"]
 SCOPE_STR = " ".join(LOGIN_SCOPES)
 
 
@@ -25,38 +28,29 @@ def _redirect_uri() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. LOGIN — build URL manually, no Flow object, no PKCE
+# 1. LOGIN — OAuth (own Drive)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_login_url(client_secret_data: dict) -> str:
-    """Builds Google OAuth URL manually — zero PKCE, no Flow state needed."""
     import urllib.parse
-    cfg       = client_secret_data.get("web", client_secret_data)
-    client_id = cfg["client_id"]
-    auth_uri  = cfg.get("auth_uri", "https://accounts.google.com/o/oauth2/auth")
-
-    params = {
-        "client_id":     client_id,
+    cfg      = client_secret_data.get("web", client_secret_data)
+    params   = {
+        "client_id":     cfg["client_id"],
         "redirect_uri":  _redirect_uri(),
         "response_type": "code",
         "scope":         SCOPE_STR,
         "access_type":   "offline",
         "prompt":        "consent",
     }
-    return f"{auth_uri}?{urllib.parse.urlencode(params)}"
+    return f"{cfg.get('auth_uri','https://accounts.google.com/o/oauth2/auth')}?{urllib.parse.urlencode(params)}"
 
 
 def verify_login(client_secret_data: dict, auth_code: str) -> tuple:
-    """
-    Exchanges auth code for tokens via direct HTTP POST — no Flow, no PKCE.
-    Returns (email, google.oauth2.credentials.Credentials).
-    """
     cfg           = client_secret_data.get("web", client_secret_data)
     client_id     = cfg["client_id"]
     client_secret = cfg["client_secret"]
     token_uri     = cfg.get("token_uri", "https://oauth2.googleapis.com/token")
 
-    # Manual token exchange
     resp = _requests.post(token_uri, data={
         "code":          auth_code.strip(),
         "client_id":     client_id,
@@ -64,13 +58,10 @@ def verify_login(client_secret_data: dict, auth_code: str) -> tuple:
         "redirect_uri":  _redirect_uri(),
         "grant_type":    "authorization_code",
     }, timeout=15)
-
     if resp.status_code != 200:
         raise ValueError(f"Token exchange failed: {resp.text}")
-
     tokens = resp.json()
 
-    # Fetch user email
     user_resp = _requests.get(
         "https://www.googleapis.com/oauth2/v3/userinfo",
         headers={"Authorization": f"Bearer {tokens['access_token']}"},
@@ -80,36 +71,49 @@ def verify_login(client_secret_data: dict, auth_code: str) -> tuple:
         raise ValueError(f"Could not fetch user info: {user_resp.text}")
     email = user_resp.json().get("email", "").lower()
 
-    # Build Credentials object for Drive API
     creds = Credentials(
-        token         = tokens["access_token"],
-        refresh_token = tokens.get("refresh_token"),
-        token_uri     = token_uri,
-        client_id     = client_id,
-        client_secret = client_secret,
-        scopes        = LOGIN_SCOPES,
+        token=tokens["access_token"], refresh_token=tokens.get("refresh_token"),
+        token_uri=token_uri, client_id=client_id, client_secret=client_secret,
+        scopes=LOGIN_SCOPES,
     )
     return email, creds
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. DRIVE OPERATIONS
+# 2. SERVICE ACCOUNT (user's Drive)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _svc(creds: Credentials):
+def get_sa_credentials() -> service_account.Credentials | None:
+    """Load SA credentials from env / secrets."""
+    raw = os.environ.get("SA_CREDENTIALS", "")
+    if not raw:
+        return None
+    try:
+        info  = json.loads(raw)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SA_SCOPES)
+        return creds
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. DRIVE OPERATIONS  (work with both OAuth and SA creds)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _svc(creds):
     return build("drive", "v3", credentials=creds)
 
 
-def get_or_create_folder(creds: Credentials, name: str, parent_id: str) -> str:
+def get_or_create_folder(creds, name: str, parent_id: str) -> str:
     svc   = _svc(creds)
+    safe  = name.replace("'", "\\'")
     query = (
         f"mimeType='application/vnd.google-apps.folder'"
-        f" and name='{name}' and '{parent_id}' in parents and trashed=false"
+        f" and name='{safe}' and '{parent_id}' in parents and trashed=false"
     )
     hits = svc.files().list(
         q=query, fields="files(id)",
-        includeItemsFromAllDrives=True,
-        supportsAllDrives=True,
+        includeItemsFromAllDrives=True, supportsAllDrives=True,
     ).execute().get("files", [])
     if hits:
         return hits[0]["id"]
@@ -118,12 +122,120 @@ def get_or_create_folder(creds: Credentials, name: str, parent_id: str) -> str:
     return folder["id"]
 
 
-def upload_file(creds: Credentials, folder_id: str, filename: str, content: bytes, mimetype: str) -> str:
+def delete_existing_files(creds, folder_id: str, filename: str) -> int:
+    """
+    Delete ALL files with the given name in the folder, regardless of owner.
+    Returns count of successfully deleted files.
+    Google Drive allows duplicate filenames — we remove every copy before re-uploading.
+    """
+    svc  = _svc(creds)
+    safe = filename.replace("'", "\\'")
+
+    hits = svc.files().list(
+        q=f"name='{safe}' and '{folder_id}' in parents and trashed=false",
+        fields="files(id)",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+        corpora="allDrives",
+    ).execute().get("files", [])
+
+    deleted = 0
+    for f in hits:
+        # Try hard delete first
+        try:
+            svc.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
+            deleted += 1
+            continue
+        except Exception:
+            pass
+        # Fall back to trash if delete is denied (e.g. owned by another user)
+        try:
+            svc.files().update(
+                fileId=f["id"],
+                body={"trashed": True},
+                supportsAllDrives=True,
+            ).execute()
+            deleted += 1
+        except Exception:
+            pass  # Can't remove — will result in duplicate for this file
+
+    return deleted
+
+
+def upload_file(creds, folder_id: str, filename: str, content: bytes, mimetype: str,
+                deduplicate: bool = True) -> str:
+    """Upload file, deleting ALL existing copies with the same name first."""
+    if deduplicate:
+        delete_existing_files(creds, folder_id, filename)
     svc   = _svc(creds)
     fh    = io.BytesIO(content)
-    media = MediaIoBaseUpload(fh, mimetype=mimetype, resumable=True)
+    media = MediaIoBaseUpload(fh, mimetype=mimetype, resumable=False)
     meta  = {"name": filename, "parents": [folder_id]}
     f     = svc.files().create(
         body=meta, media_body=media, fields="id", supportsAllDrives=True,
     ).execute()
     return f["id"]
+
+
+def download_latest_template(creds, parent_id: str) -> bytes | None:
+    """
+    Download _LATEST_TEMPLATE.psd (or .psb) from the parent folder.
+    Returns file bytes, or None if not found.
+    """
+    svc  = _svc(creds)
+    hits = svc.files().list(
+        q=f"name='_LATEST_TEMPLATE.psd' and '{parent_id}' in parents and trashed=false",
+        fields="files(id,name,size)",
+        includeItemsFromAllDrives=True, supportsAllDrives=True,
+        corpora="allDrives",
+    ).execute().get("files", [])
+    # Also check .psb
+    if not hits:
+        hits = svc.files().list(
+            q=f"name='_LATEST_TEMPLATE.psb' and '{parent_id}' in parents and trashed=false",
+            fields="files(id,name,size)",
+            includeItemsFromAllDrives=True, supportsAllDrives=True,
+            corpora="allDrives",
+        ).execute().get("files", [])
+    if not hits:
+        return None
+    file_id = hits[0]["id"]
+    request = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buf = io.BytesIO()
+    from googleapiclient.http import MediaIoBaseDownload
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+
+def list_subfolders(creds, parent_id: str) -> list[dict]:
+    """List all subfolders in parent. Returns [{"id":..., "name":...}, ...]"""
+    svc  = _svc(creds)
+    hits = svc.files().list(
+        q=f"mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed=false",
+        fields="files(id,name)",
+        includeItemsFromAllDrives=True, supportsAllDrives=True,
+        pageSize=500,
+    ).execute().get("files", [])
+    return hits
+
+
+def update_template_in_all_folders(creds, parent_id: str, template_bytes: bytes,
+                                   mimetype: str) -> tuple[int, int]:
+    """
+    Upload/replace template PSD in every subfolder of parent_id.
+    Template file is named after the folder.
+    Returns (success_count, error_count).
+    """
+    folders = list_subfolders(creds, parent_id)
+    ok = err = 0
+    for folder in folders:
+        try:
+            fname = f"{folder['name']}.psd"
+            upload_file(creds, folder["id"], fname, template_bytes, mimetype, deduplicate=True)
+            ok += 1
+        except Exception:
+            err += 1
+    return ok, err

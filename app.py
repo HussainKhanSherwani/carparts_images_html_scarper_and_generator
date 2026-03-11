@@ -8,6 +8,16 @@ import hashlib
 import os
 from datetime import datetime, timedelta
 from streamlit_cookies_manager import EncryptedCookieManager
+from drive_helper import (
+    get_login_url, verify_login,
+    get_or_create_folder, upload_file, get_sa_credentials,
+    list_subfolders, update_template_in_all_folders, download_latest_template,
+)
+from googleapiclient.discovery import build
+from scraper import (
+    scrape_ebay_item, merge_all_data,
+    extract_text_data, extract_item_number, parse_links,
+)
 
 # ── Cookie manager (persistent login for 7 days) ─────────────────────────────
 cookies = EncryptedCookieManager(
@@ -21,7 +31,7 @@ st.set_page_config(
     page_title="eBay Listing Generator",
     page_icon="🛒",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown("""
@@ -113,8 +123,6 @@ hr { border-color:#2a2a2a !important; }
 ALLOWED_EMAILS = {
     "hussainkhansherwani09@gmail.com",
     "ghulamhussainsherwani@gmail.com",
-    "agencyleadmanager@gmail.com",
-    "tahseenimran78@gmail.com"
     # add more as needed
 }
 
@@ -125,11 +133,14 @@ SCRAPING_ANT_KEY = ""   # set via env var or st.secrets in production
 # SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════════
 for k, v in {
-    "user_email":   None,
-    "drive_creds":  None,
-    "logs":         [],
-    "output_zip":   None,
-    "results":      [],
+    "user_email":     None,
+    "drive_creds":    None,
+    "psd_template":   None,    # bytes of latest PSD template
+    "psd_filename":   None,    # original filename of uploaded PSD
+    "psd_source":     None,    # "upload" or "drive"
+    "logs":           [],
+    "output_zip":     None,
+    "results":        [],
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -138,11 +149,27 @@ for k, v in {
 if st.session_state.user_email is None:
     _cookie_email   = cookies.get("user_email", "")
     _cookie_expiry  = cookies.get("login_expiry", "")
+    _cookie_creds   = cookies.get("drive_creds", "")
     if _cookie_email and _cookie_expiry:
         try:
             _expiry_dt = datetime.fromisoformat(_cookie_expiry)
             if datetime.utcnow() < _expiry_dt and _cookie_email in ALLOWED_EMAILS:
                 st.session_state.user_email = _cookie_email
+                # Restore Drive credentials from cookie
+                if _cookie_creds and st.session_state.drive_creds is None:
+                    try:
+                        from google.oauth2.credentials import Credentials as _Creds
+                        _cd = json.loads(_cookie_creds)
+                        st.session_state.drive_creds = _Creds(
+                            token         = _cd.get("token"),
+                            refresh_token = _cd.get("refresh_token"),
+                            token_uri     = _cd.get("token_uri"),
+                            client_id     = _cd.get("client_id"),
+                            client_secret = _cd.get("client_secret"),
+                            scopes        = _cd.get("scopes", []),
+                        )
+                    except Exception:
+                        pass  # creds corrupt — user will need to re-login once
         except Exception:
             pass
 
@@ -166,6 +193,8 @@ def _get_secret(key: str, fallback: str = "") -> str:
 
 ANT_KEY         = _get_secret("SCRAPING_ANT_KEY", SCRAPING_ANT_KEY)
 DRIVE_FOLDER_ID = _get_secret("DRIVE_FOLDER_ID", "")
+_emails_raw     = _get_secret("ALLOWED_EMAILS", "hussainkhansherwani09@gmail.com,ghulamhussainsherwani@gmail.com")
+ALLOWED_EMAILS  = {e.strip().lower() for e in _emails_raw.split(",") if e.strip()}
 _CS_RAW         = _get_secret("CLIENT_SECRET", "")
 CLIENT_SECRET   = json.loads(_CS_RAW) if _CS_RAW else None
 
@@ -188,29 +217,117 @@ if "template_content" not in st.session_state:
 # SIDEBAR — dev fallbacks only
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown('<div class="step-label">⚙ Dev / Local Config</div>', unsafe_allow_html=True)
-    st.caption("Only needed if secrets.toml is not configured.")
+    st.markdown('<div class="step-label">⚙ Config</div>', unsafe_allow_html=True)
 
+    # ── Dev fallbacks ─────────────────────────────────────────────────────
+    st.caption("Only needed if secrets.toml is not configured.")
     if not CLIENT_SECRET:
         cs_upload = st.file_uploader("client_secret.json", type=["json"])
         if cs_upload:
             CLIENT_SECRET = json.loads(cs_upload.read())
             st.success("client_secret loaded")
-
     if not ANT_KEY:
         ANT_KEY = st.text_input("ScrapingAnt API Key", type="password")
-
     if not DRIVE_FOLDER_ID:
         DRIVE_FOLDER_ID = st.text_input("Drive Folder ID", placeholder="1C-pzZz...")
 
+    # ── PSD Template ──────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="step-label">🎨 Photoshop Template</div>', unsafe_allow_html=True)
+    _psd_up = st.file_uploader("Upload latest .psd / .psb", type=["psd", "psb"], key="psd_uploader")
+    if _psd_up:
+        # Only process on first upload — skip re-runs caused by Streamlit rerenders
+        _psd_hash = hashlib.md5(_psd_up.getvalue()).hexdigest()
+        if _psd_hash != st.session_state.get("psd_hash"):
+            st.session_state.psd_template = _psd_up.getvalue()
+            st.session_state.psd_filename = _psd_up.name
+            st.session_state.psd_source   = "upload"
+            st.session_state["psd_hash"]  = _psd_hash
+            st.success(f"Template loaded: {_psd_up.name}")
+
+    if st.session_state.psd_template:
+        st.caption(f"{st.session_state.psd_filename} ({len(st.session_state.psd_template)//1024} KB)")
+        if st.button("🔄 Update Template in All Drive Folders", key="update_tpl_btn"):
+            _active_creds = st.session_state.drive_creds
+            _tpl_root = DRIVE_FOLDER_ID
+            if not _active_creds:
+                st.error("No Drive credentials — sign in first.")
+            elif not _tpl_root:
+                st.error("Drive Folder ID not set.")
+            else:
+                with st.spinner("Saving to Drive and updating all folders..."):
+                    # 1. Save as _LATEST_TEMPLATE in parent folder
+                    try:
+                        upload_file(_active_creds, _tpl_root,
+                                    "_LATEST_TEMPLATE.psd",
+                                    st.session_state.psd_template,
+                                    "image/vnd.adobe.photoshop", deduplicate=True)
+                    except Exception as _e:
+                        st.warning(f"Could not save _LATEST_TEMPLATE: {_e}")
+                    # 2. Push renamed copy to every item subfolder
+                    _folders = list_subfolders(_active_creds, _tpl_root)
+                    if not _folders:
+                        st.warning(f"No subfolders found in `{_tpl_root}`.")
+                    else:
+                        ok, err = update_template_in_all_folders(
+                            _active_creds, _tpl_root,
+                            st.session_state.psd_template, "image/vnd.adobe.photoshop"
+                        )
+                        st.success(f"Saved to Drive + updated {ok} of {len(_folders)} folder(s)." + (f" {err} error(s)." if err else ""))
+
+    # ── Clean duplicates ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="step-label">🧹 Maintenance</div>', unsafe_allow_html=True)
+    if st.button("🧹 Remove Duplicate Files in Drive", key="clean_dupes_btn"):
+        _clean_creds = st.session_state.drive_creds
+        _clean_root  = DRIVE_FOLDER_ID
+        if not _clean_creds:
+            st.error("Sign in first.")
+        elif not _clean_root:
+            st.error("Set Drive Folder ID first.")
+        else:
+            with st.spinner("Scanning for duplicates..."):
+                _svc_obj = build("drive", "v3", credentials=_clean_creds)
+                _folders = list_subfolders(_clean_creds, _clean_root)
+                _total_removed = 0
+                for _fold in _folders:
+                    # Get all files in this folder
+                    _files = _svc_obj.files().list(
+                        q=f"'{_fold['id']}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false",
+                        fields="files(id,name)",
+                        includeItemsFromAllDrives=True, supportsAllDrives=True,
+                        corpora="allDrives", pageSize=500,
+                    ).execute().get("files", [])
+                    # Group by name — keep newest, delete rest
+                    from collections import defaultdict
+                    _by_name = defaultdict(list)
+                    for _fi in _files:
+                        _by_name[_fi["name"]].append(_fi["id"])
+                    for _name, _ids in _by_name.items():
+                        if len(_ids) > 1:
+                            # Delete all but the last one
+                            for _dup_id in _ids[:-1]:
+                                try:
+                                    _svc_obj.files().delete(fileId=_dup_id, supportsAllDrives=True).execute()
+                                    _total_removed += 1
+                                except Exception:
+                                    try:
+                                        _svc_obj.files().update(fileId=_dup_id, body={"trashed": True}, supportsAllDrives=True).execute()
+                                        _total_removed += 1
+                                    except Exception:
+                                        pass
+            st.success(f"Removed {_total_removed} duplicate file(s) across {len(_folders)} folder(s).")
+
+    # ── Sign out ──────────────────────────────────────────────────────────
     if st.session_state.user_email:
         st.markdown("---")
         st.markdown(f'<div class="user-chip"><span class="dot"></span>{st.session_state.user_email}</div>', unsafe_allow_html=True)
-        if st.button("Sign out"):
+        if st.button("Sign out", key="sidebar_signout"):
             st.session_state.user_email  = None
             st.session_state.drive_creds = None
             cookies["user_email"]   = ""
             cookies["login_expiry"] = ""
+            cookies["drive_creds"]  = ""
             cookies.save()
             st.rerun()
 
@@ -230,8 +347,7 @@ if not st.session_state.user_email:
         st.warning("⚠️ client_secret.json not configured. Upload it in the sidebar.")
         st.stop()
 
-    from drive_helper import get_login_url, verify_login
-
+    
     # Check if Google redirected back with ?code= in URL
     _params     = st.query_params
     _auth_code  = _params.get("code", "")
@@ -247,8 +363,18 @@ if not st.session_state.user_email:
                     st.session_state.user_email  = email
                     st.session_state.drive_creds = drive_creds
                     _expiry = (datetime.utcnow() + timedelta(days=7)).isoformat()
+                    # Serialize creds to cookie so they survive page refresh
+                    _creds_data = json.dumps({
+                        "token":         drive_creds.token,
+                        "refresh_token": drive_creds.refresh_token,
+                        "token_uri":     drive_creds.token_uri,
+                        "client_id":     drive_creds.client_id,
+                        "client_secret": drive_creds.client_secret,
+                        "scopes":        list(drive_creds.scopes or []),
+                    })
                     cookies["user_email"]   = email
                     cookies["login_expiry"] = _expiry
+                    cookies["drive_creds"]  = _creds_data
                     cookies.save()
                     st.rerun()
                 else:
@@ -280,11 +406,6 @@ if not st.session_state.user_email:
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN APP  (only reachable after successful login)
 # ══════════════════════════════════════════════════════════════════════════════
-from drive_helper import get_or_create_folder, upload_file
-from scraper      import (
-    scrape_ebay_item, merge_all_data,
-    extract_text_data, extract_item_number, parse_links,
-)
 
 # Header
 st.markdown(f"""
@@ -304,6 +425,7 @@ with _signout_col:
         st.session_state.drive_creds = None
         cookies["user_email"]   = ""
         cookies["login_expiry"] = ""
+        cookies["drive_creds"]  = ""
         cookies.save()
         st.rerun()
 
@@ -381,6 +503,17 @@ if _missing:
 
 if st.button("🚀 Generate Listings", disabled=bool(_missing)):
     template = st.session_state["template_content"]
+
+    # Auto-fetch PSD template from Drive if not already loaded in session
+    if not st.session_state.psd_template and st.session_state.drive_creds and DRIVE_FOLDER_ID:
+        with st.spinner("Fetching _LATEST_TEMPLATE.psd from Drive..."):
+            _auto_tpl = download_latest_template(st.session_state.drive_creds, DRIVE_FOLDER_ID)
+        if _auto_tpl:
+            st.session_state.psd_template = _auto_tpl
+            st.session_state.psd_filename = "_LATEST_TEMPLATE.psd"
+            st.session_state.psd_source   = "drive"
+            st.toast("Template loaded from Drive ✅")
+
     st.session_state.logs       = []
     st.session_state.results    = []
     st.session_state.output_zip = None
@@ -497,43 +630,62 @@ if st.button("🚀 Generate Listings", disabled=bool(_missing)):
 
             # ── Stage 4: Packing ZIP ──────────────────────────────────────
             update_ui(idx, item_id, "Packing ZIP...", base_pct + 14)
-            # Use same naming convention as Drive: PartLinkNumber HiddenSKU ItemID
-            _pln_z  = scraped.get("part_link_number") or ""
-            _sku_z  = scraped.get("hidden_sku") or ""
+            # Folder: PartLinkNumber HiddenSKU ItemID
+            _pln_z      = scraped.get("part_link_number") or ""
+            _sku_z      = scraped.get("hidden_sku") or ""
             _zip_folder = " ".join(p for p in [_pln_z, _sku_z, item_id] if p)
             if html_str:
-                zf.writestr(f"{_zip_folder}/{item_id}.html", html_str)
+                zf.writestr(f"{_zip_folder}/{_zip_folder}.html", html_str)
             if text_str:
-                zf.writestr(f"{_zip_folder}/{item_id}.txt", text_str)
+                zf.writestr(f"{_zip_folder}/{_zip_folder}.txt", text_str)
+            # Images flat in parent folder: {sku}_{img_no}.jpg
             if gen_images and scraped["cloud_images"]:
                 for img_no, img_bytes in scraped["cloud_images"].items():
-                    zf.writestr(f"{_zip_folder}/{sku}/{img_no}.jpg", img_bytes)
+                    zf.writestr(f"{_zip_folder}/{sku}_{img_no}.jpg", img_bytes)
+            # PSD template named after folder
+            if st.session_state.psd_template:
+                zf.writestr(f"{_zip_folder}/{_zip_folder}.psd", st.session_state.psd_template)
 
             # ── Stage 5: Drive upload ─────────────────────────────────────
             if upload_drive and DRIVE_FOLDER_ID:
-                if not st.session_state.drive_creds:
-                    add_log("Drive skipped — sign out and back in for Drive access", "warn")
-                    upload_drive = False
-                else:
-                    update_ui(idx, item_id, "Uploading to Drive...", base_pct + 16)
-                    try:
-                        _creds = st.session_state.drive_creds
-                        # Folder name: PartLinkNumber + HiddenSKU + SourceItemNumber(item_id)
-                        _pln   = scraped.get("part_link_number") or ""
-                        _sku_f = scraped.get("hidden_sku") or ""
-                        _parts = [p for p in [_pln, _sku_f, item_id] if p]
-                        folder_display_name = " ".join(_parts)
-                        item_folder = get_or_create_folder(_creds, folder_display_name, DRIVE_FOLDER_ID)
-                        if html_str:
-                            upload_file(_creds, item_folder, f"{item_id}.html", html_str.encode("utf-8"), "text/html")
-                        if text_str:
-                            upload_file(_creds, item_folder, f"{item_id}.txt", text_str.encode("utf-8"), "text/plain")
-                        if scraped["cloud_images"]:
-                            img_folder = get_or_create_folder(_creds, sku, item_folder)
-                            for img_no, img_bytes in scraped["cloud_images"].items():
-                                upload_file(_creds, img_folder, f"{img_no}.jpg", img_bytes, "image/jpeg")
-                        add_log("Uploaded to Drive ✓", "ok")
-                    except Exception as e:
+                update_ui(idx, item_id, "Uploading to Drive...", base_pct + 16)
+                try:
+                    # Use logged-in user's OAuth credentials
+                    _creds = st.session_state.drive_creds
+                    _drive_root = DRIVE_FOLDER_ID
+                    if not _creds:
+                        add_log("Drive skipped — sign out and back in to reconnect Google Drive", "warn")
+                        raise RuntimeError("no OAuth creds")
+                    if not _drive_root:
+                        add_log("Drive skipped — DRIVE_FOLDER_ID not set in secrets", "warn")
+                        raise RuntimeError("no folder ID")
+                    # Folder: PartLinkNumber HiddenSKU ItemID
+                    _pln   = scraped.get("part_link_number") or ""
+                    _sku_f = scraped.get("hidden_sku") or ""
+                    folder_display_name = " ".join(p for p in [_pln, _sku_f, item_id] if p)
+                    item_folder = get_or_create_folder(_creds, folder_display_name, _drive_root)
+                    # HTML + TXT named after folder (deduplicated)
+                    if html_str:
+                        upload_file(_creds, item_folder, f"{folder_display_name}.html", html_str.encode("utf-8"), "text/html")
+                    if text_str:
+                        upload_file(_creds, item_folder, f"{folder_display_name}.txt", text_str.encode("utf-8"), "text/plain")
+                    # Images: {sku}_{img_no}.jpg flat in parent folder
+                    if scraped["cloud_images"]:
+                        for img_no, img_bytes in scraped["cloud_images"].items():
+                            upload_file(_creds, item_folder, f"{sku}_{img_no}.jpg", img_bytes, "image/jpeg")
+                    # PSD template named after folder
+                    if st.session_state.psd_template:
+                        upload_file(_creds, item_folder,
+                                    f"{folder_display_name}.psd",
+                                    st.session_state.psd_template,
+                                    "image/vnd.adobe.photoshop")
+                        # Also keep master copy in root output folder
+                        upload_file(_creds, _drive_root,
+                                    "_LATEST_TEMPLATE.psd",
+                                    st.session_state.psd_template,
+                                    "image/vnd.adobe.photoshop")
+                    add_log("Uploaded to Drive ✓", "ok")
+                except Exception as e:
                         if hasattr(e, "resp") and hasattr(e, "content"):
                             status = e.resp.status
                             try:
@@ -544,7 +696,7 @@ if st.button("🚀 Generate Listings", disabled=bool(_missing)):
                                 msg = f"HTTP {status} — {e.content}"
                             add_log(f"Drive error: {msg}", "error")
                             if status == 403:
-                                add_log("Fix: Share Drive folder with your account (Editor)", "warn")
+                                add_log("Fix: Make sure the Drive folder is shared with your account (Editor)", "warn")
                             elif status == 404:
                                 add_log("Fix: Check DRIVE_FOLDER_ID in secrets.toml", "warn")
                         else:
