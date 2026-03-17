@@ -177,6 +177,35 @@ def upload_file(creds, folder_id: str, filename: str, content: bytes, mimetype: 
     return f["id"]
 
 
+def find_file_in_folder(creds, folder_id: str, filename: str) -> str | None:
+    """Return file ID if a file with this exact name exists in folder, else None."""
+    svc  = _svc(creds)
+    safe = filename.replace("'", "\'")
+    hits = svc.files().list(
+        q=f"name='{safe}' and '{folder_id}' in parents and trashed=false",
+        fields="files(id)",
+        includeItemsFromAllDrives=True, supportsAllDrives=True,
+        corpora="allDrives",
+    ).execute().get("files", [])
+    return hits[0]["id"] if hits else None
+
+
+def download_file_bytes(creds, file_id: str) -> bytes | None:
+    """Download any Drive file by ID, return raw bytes."""
+    svc = _svc(creds)
+    try:
+        request = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+        buf = io.BytesIO()
+        from googleapiclient.http import MediaIoBaseDownload
+        dl = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 def download_latest_template(creds, parent_id: str) -> bytes | None:
     """
     Download _LATEST_TEMPLATE.psd (or .psb) from the parent folder.
