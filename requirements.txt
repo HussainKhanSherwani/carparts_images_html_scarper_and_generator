@@ -12,12 +12,3 @@ python-dotenv
 lxml
 google-generativeai
 urllib3
-http-client
-re
-json
-io
-os
-hashlib
-zipfile
-time
-html
